@@ -57,15 +57,22 @@ jobs:
           HXM5_MAX_POSTS_PER_CYCLE: ${{ secrets.HXM5_MAX_POSTS_PER_CYCLE }}
         run: python3 actions_monitor.py --once
 
-      # 把状态和当日存档提交回仓库 —— 这是去重能跨轮生效的唯一方式
+      # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
+      # 注意：git add 是原子的，若路径中有不存在的，整条命令会失败，
+      #       所以这里只加 state（archive 已在 .gitignore 里，不进仓库）。
       - name: 保存去重状态
         run: |
           git config user.name  "hxm5-bot"
           git config user.email "hxm5-bot@users.noreply.github.com"
-          git add -f state/hxm5_state.json archive 2>/dev/null || true
+          if [ ! -f state/hxm5_state.json ]; then
+            echo "没有状态文件，跳过"
+            exit 0
+          fi
+          git add -f state/hxm5_state.json
           if git diff --cached --quiet; then
             echo "状态无变化，跳过提交"
           else
             git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
+            echo "状态已提交"
           fi
