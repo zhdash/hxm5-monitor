@@ -1,0 +1,71 @@
+name: 线报屋监控
+
+# 每 5 分钟跑一次（GitHub Actions 免费版最小间隔就是 5 分钟）
+# 注意：GitHub 的 cron 是 UTC，且高峰期可能延迟几分钟，属正常现象。
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  # 允许在网页上手动点「Run workflow」触发，方便调试
+  workflow_dispatch:
+
+# 需要写权限才能把 state.json 提交回仓库
+permissions:
+  contents: write
+
+# 同一时刻只允许一个实例，避免两个 run 同时写状态导致去重失效
+concurrency:
+  group: hxm5-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    # 单轮最多 10 分钟，正常只要几秒
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 上一轮提交回来的去重状态。首次运行时文件不存在，脚本会自动初始化基线。
+      - name: 恢复去重状态
+        run: |
+          mkdir -p state
+          if [ -f state/hxm5_state.json ]; then
+            echo "已有状态：$(python3 -c "import json;print(len(json.load(open('state/hxm5_state.json'))['seen']))") 条记录"
+          else
+            echo "首次运行，将初始化基线"
+          fi
+
+      # 配置全部走 Secrets（不用 Variables，避免多要一类权限）
+      # 未配置的项在脚本内有默认值兜底：CID=3 / 回复15条 / 不推图
+      - name: 执行监控
+        env:
+          HXM5_STATE_PATH: state/hxm5_state.json
+          HXM5_WECOM_WEBHOOK: ${{ secrets.HXM5_WECOM_WEBHOOK }}
+          HXM5_CID: ${{ secrets.HXM5_CID }}
+          HXM5_BARK_KEY: ${{ secrets.HXM5_BARK_KEY }}
+          HXM5_BARK_LEVEL: ${{ secrets.HXM5_BARK_LEVEL }}
+          HXM5_MAX_IMAGES: ${{ secrets.HXM5_MAX_IMAGES }}
+          HXM5_REPLY_LIMIT: ${{ secrets.HXM5_REPLY_LIMIT }}
+          HXM5_PUSH_IMAGES: ${{ secrets.HXM5_PUSH_IMAGES }}
+          HXM5_MAX_POSTS_PER_CYCLE: ${{ secrets.HXM5_MAX_POSTS_PER_CYCLE }}
+        run: python3 actions_monitor.py --once
+
+      # 把状态和当日存档提交回仓库 —— 这是去重能跨轮生效的唯一方式
+      - name: 保存去重状态
+        run: |
+          git config user.name  "hxm5-bot"
+          git config user.email "hxm5-bot@users.noreply.github.com"
+          git add -f state/hxm5_state.json archive 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "状态无变化，跳过提交"
+          else
+            git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
