@@ -1,0 +1,25 @@
+# 绝对不要提交的东西
+gh_token.txt
+.gh_token
+credentials.json
+config.json
+
+# 本地调试产物
+_test_state.json
+_test_state.json.tmp
+monitor.log
+monitor.log.1
+*.pid
+run.lock
+cron.out
+__pycache__/
+*.pyc
+
+# 旧平台的本地状态（Actions 版用的是 state/hxm5_state.json）
+state.json
+archive/
+backup_before_delete/
+
+# 系统
+.DS_Store
+Thumbs.db
