@@ -73,8 +73,20 @@ jobs:
           git add -f state/hxm5_state.json
           if git diff --cached --quiet; then
             echo "状态无变化，跳过提交"
-          else
-            git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
-            echo "状态已提交"
+            exit 0
           fi
+          git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # 并发场景：两个 run 撞在一起时，远端可能已被另一个更新，
+          # 直接 push 会被拒（non-fast-forward）导致整个 run 标红。
+          # 这里 rebase 后重试；仍失败也只给 warning，不让 run 失败（下轮会补上状态）。
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin main >/dev/null 2>&1 \
+               && git push >/dev/null 2>&1; then
+              echo "状态已提交（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "第 $i 次推送失败，3 秒后重试..."
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep 3
+          done
+          echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
