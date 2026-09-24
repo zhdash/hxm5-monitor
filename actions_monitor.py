@@ -20,6 +20,7 @@ import time
 import re
 import base64
 import hashlib
+import hmac
 import html as htmllib
 import urllib.request
 import urllib.error
@@ -60,6 +61,8 @@ def load_config():
     CONFIG = {
         "cid": cfg("cid", 3, int),
         "wecom_webhook": cfg("wecom_webhook", ""),
+        "dingtalk_webhook": cfg("dingtalk_webhook", ""),
+        "dingtalk_secret": cfg("dingtalk_secret", ""),
         "bark_key": cfg("bark_key", ""),
         "bark_server": cfg("bark_server", "https://api.day.app"),
         "bark_level": cfg("bark_level", "timeSensitive"),
@@ -277,6 +280,89 @@ def push_wecom_image(img_url):
         return False
 
 
+# ------------------------------------------------------------ 钉钉
+def _dingtalk_sign(secret):
+    """加签模式：timestamp + HMAC-SHA256(secret, "ts\nsecret")"""
+    ts = str(round(time.time() * 1000))
+    s2s = "%s\n%s" % (ts, secret)
+    h = hmac.new(secret.encode("utf-8"), s2s.encode("utf-8"),
+                 digestmod=hashlib.sha256).digest()
+    return ts, urllib.parse.quote_plus(base64.b64encode(h))
+
+
+def build_dingtalk(t, cid_title):
+    """钉钉 markdown：不支持 font 颜色/表格；图片走 ![alt](url)。
+
+    链接必须用代码块包住 —— 钉钉会把裸 URL 自动链接化，一旦链接化就
+    「点击被安全网关拦 + 复制出来是 URL 编码」两个坑同时中招，
+    只有代码块里的原文才能被长按干净复制（2026-09-17 实测结论）。
+    """
+    title = clean_text(t.get("title") or t.get("word") or "(无标题)")
+    content = clean_text(t.get("Content"))
+    nick = t.get("nick") or ""
+    ttime = t.get("time") or ""
+    tid = t.get("ID")
+    replies = t.get("reply") or []
+    imgs = t.get("img") or []
+
+    n_title = "线报屋·%s" % title
+    if len(n_title) > 40:
+        n_title = n_title[:40] + "…"
+
+    L = ["### %s" % title]
+    if ttime or nick:
+        L.append("> %s %s" % (ttime, nick))
+    if content:
+        L.append(content)
+    if imgs and CONFIG.get("include_images", True):
+        L.append("")
+        for u in imgs[:6]:
+            L.append("![图片](%s)" % u)
+    if replies and CONFIG.get("include_replies", True):
+        lim = CONFIG.get("reply_limit", 15)
+        L.append("")
+        L.append("**回复 %d 条**" % len(replies))
+        for r in replies[:lim]:
+            rc = clean_text(r.get("Content")).replace("\n", " ")
+            if len(rc) > 140:
+                rc = rc[:140] + "…"
+            L.append("> **%s**：%s" % (r.get("nick") or "匿名", rc))
+        if len(replies) > lim:
+            L.append("> …还有 %d 条" % (len(replies) - lim))
+    L.append("")
+    L.append("原帖：")
+    L.append("```")
+    L.append("%s/t/%s" % (BASE, tid))
+    L.append("```")
+    return n_title, truncate_bytes("\n".join(L), 4000)
+
+
+def push_dingtalk(title, text):
+    url = (CONFIG.get("dingtalk_webhook") or "").strip()
+    if not url:
+        return False
+    secret = (CONFIG.get("dingtalk_secret") or "").strip()
+    if secret:
+        ts, sign = _dingtalk_sign(secret)
+        url = "%s%stimestamp=%s&sign=%s" % (
+            url, "&" if "?" in url else "?", ts, sign)
+    payload = {"msgtype": "markdown",
+               "markdown": {"title": title, "text": text}}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read().decode("utf-8", "replace"))
+        if res.get("errcode") == 0:
+            return True
+        log("钉钉推送失败: %s" % res, "ERROR")
+        return False
+    except Exception as e:  # noqa
+        log("钉钉推送异常: %s" % e, "ERROR")
+        return False
+
+
 # ------------------------------------------------------------ Bark (iOS)
 def build_bark_message(t):
     title = clean_text(t.get("title") or t.get("word") or "(无标题)")
@@ -352,10 +438,17 @@ def push_all(t, cid_title):
     imgs = t.get("img") or []
     has_wecom = bool((CONFIG.get("wecom_webhook") or "").strip())
     has_bark = bool((CONFIG.get("bark_key") or "").strip())
+    has_dt = bool((CONFIG.get("dingtalk_webhook") or "").strip())
 
     if has_wecom:
         ok = push_wecom(build_markdown(t, cid_title))
         detail.append("企微=%s" % ("ok" if ok else "FAIL"))
+        any_ok = any_ok or ok
+
+    if has_dt:
+        dt_title, dt_text = build_dingtalk(t, cid_title)
+        ok = push_dingtalk(dt_title, dt_text)
+        detail.append("钉钉=%s" % ("ok" if ok else "FAIL"))
         any_ok = any_ok or ok
 
     if has_bark:
