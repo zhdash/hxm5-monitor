@@ -48,6 +48,8 @@ jobs:
         env:
           HXM5_STATE_PATH: state/hxm5_state.json
           HXM5_WECOM_WEBHOOK: ${{ secrets.HXM5_WECOM_WEBHOOK }}
+          HXM5_DINGTALK_WEBHOOK: ${{ secrets.HXM5_DINGTALK_WEBHOOK }}
+          HXM5_DINGTALK_SECRET: ${{ secrets.HXM5_DINGTALK_SECRET }}
           HXM5_CID: ${{ secrets.HXM5_CID }}
           HXM5_BARK_KEY: ${{ secrets.HXM5_BARK_KEY }}
           HXM5_BARK_LEVEL: ${{ secrets.HXM5_BARK_LEVEL }}
