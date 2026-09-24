@@ -47,7 +47,9 @@ jobs:
       - name: 执行监控
         env:
           HXM5_STATE_PATH: state/hxm5_state.json
-          HXM5_WECOM_WEBHOOK: ${{ secrets.HXM5_WECOM_WEBHOOK }}
+          # 企微已于 2026-09-24 按老大要求关闭（GitHub 版只推钉钉）
+          # 恢复办法：取消下一行注释，并确认 Secret HXM5_WECOM_WEBHOOK 存在
+          # HXM5_WECOM_WEBHOOK: ${{ secrets.HXM5_WECOM_WEBHOOK }}
           HXM5_DINGTALK_WEBHOOK: ${{ secrets.HXM5_DINGTALK_WEBHOOK }}
           HXM5_DINGTALK_SECRET: ${{ secrets.HXM5_DINGTALK_SECRET }}
           HXM5_CID: ${{ secrets.HXM5_CID }}
