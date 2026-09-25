@@ -510,7 +510,11 @@ def archive_post(t):
 def run_once(dry=False):
     cfg = load_config()
     state = load_state()
-    if not (cfg.get("wecom_webhook") or "").strip() and not (cfg.get("bark_key") or "").strip() and not dry:
+    # 只要任意一个渠道配置了就继续（注意：新增渠道时必须同步加进来，
+    # 否则会出现「关了旧渠道 → 脚本以为没渠道 → 直接退出 → 一条不推」）
+    _has_any = any((cfg.get(k) or "").strip() for k in
+                   ("wecom_webhook", "dingtalk_webhook", "bark_key"))
+    if not _has_any and not dry:
         log("没有配置任何推送渠道，退出", "ERROR")
         return 0
 
@@ -578,6 +582,11 @@ def main():
             if push_wecom("**线报屋监控 · 推送测试**\n\n"
                           "如果你看到这条消息，说明 GitHub Actions 通道已打通。\n\n"
                           "> 监控板块：%s\n> 时间：%s" % (CONFIG.get("cid"), ts)):
+                ok = True
+        if (CONFIG.get("dingtalk_webhook") or "").strip():
+            if push_dingtalk("线报屋监控 · 推送测试",
+                             "如果你看到这条消息，说明 GitHub Actions 钉钉通道已打通。\n\n"
+                             "监控板块：%s\n时间：%s" % (CONFIG.get("cid"), ts)):
                 ok = True
         if (CONFIG.get("bark_key") or "").strip():
             if push_bark("[线报屋] 推送测试",
