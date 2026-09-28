@@ -1,7 +1,25 @@
 name: 线报屋监控
 
-# 每 5 分钟跑一次（GitHub Actions 免费版最小间隔就是 5 分钟）
-# 注意：GitHub 的 cron 是 UTC，且高峰期可能延迟几分钟，属正常现象。
+# ============================================================
+# ⚠️ 重要背景（2026-09-28 实测）
+#
+# GitHub Actions 的 schedule 自 2026-08-26 起出现平台级故障，定时触发被大幅延迟。
+# 本仓库配置的是 */5（理论每 5 分钟一次），但对最近 60 次运行实测下来：
+#     间隔 最短 105 / 中位 205 / 平均 227 / 最长 413 分钟（变异系数 63%）
+#     理论 288 次/天  →  实际约 6 次/天，中位慢了 41 倍
+# 与套餐、计费、仓库活跃度均无关。社区讨论：
+#     https://github.com/orgs/community/discussions/206019
+#
+# 应对：不再指望 cron 的频率，改成「一次触发，job 内长循环」——
+#   · 只要被触发一次（cron 或手动都行），就连续盯约 5 小时 40 分，
+#     中间每 5 分钟扫一轮，覆盖率从「每天 6 次」拉满到接近连续。
+#   · concurrency 保持 cancel-in-progress: false：
+#       同一时刻只有 1 个实例在跑，新的排队等着「接力」。
+#       GitHub 对同一 concurrency group 只保留 1 个 pending，
+#       更新的触发会替换掉旧的 pending，所以【不会堆积累积】。
+#       这样长循环不会被打断，去重状态提交也最安全。
+# ============================================================
+
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -13,6 +31,7 @@ permissions:
   contents: write
 
 # 同一时刻只允许一个实例，避免两个 run 同时写状态导致去重失效
+# 新的触发会成为 pending，等当前这个跑完立刻接力（不算打断）
 concurrency:
   group: hxm5-monitor
   cancel-in-progress: false
@@ -20,8 +39,9 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # 单轮最多 10 分钟，正常只要几秒
-    timeout-minutes: 10
+    # GitHub 单个 job 硬上限 360 分钟。这里留 15 分钟余量
+    # 给 checkout / setup-python / 收尾，循环体内自限 340 分钟。
+    timeout-minutes: 355
 
     steps:
       - name: 拉取代码
@@ -32,19 +52,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 上一轮提交回来的去重状态。首次运行时文件不存在，脚本会自动初始化基线。
-      - name: 恢复去重状态
+      # 循环内多轮提交，身份只需配一次
+      - name: 配置 git 身份
         run: |
-          mkdir -p state
-          if [ -f state/hxm5_state.json ]; then
-            echo "已有状态：$(python3 -c "import json;print(len(json.load(open('state/hxm5_state.json'))['seen']))") 条记录"
-          else
-            echo "首次运行，将初始化基线"
-          fi
+          git config user.name  "hxm5-bot"
+          git config user.email "hxm5-bot@users.noreply.github.com"
 
-      # 配置全部走 Secrets（不用 Variables，避免多要一类权限）
-      # 未配置的项在脚本内有默认值兜底：CID=3 / 回复15条 / 不推图
-      - name: 执行监控
+      - name: 循环监控（长循环覆盖 cron 延迟）
         env:
           HXM5_STATE_PATH: state/hxm5_state.json
           # 企微已于 2026-09-24 按老大要求关闭（GitHub 版只推钉钉）
@@ -59,36 +73,62 @@ jobs:
           HXM5_REPLY_LIMIT: ${{ secrets.HXM5_REPLY_LIMIT }}
           HXM5_PUSH_IMAGES: ${{ secrets.HXM5_PUSH_IMAGES }}
           HXM5_MAX_POSTS_PER_CYCLE: ${{ secrets.HXM5_MAX_POSTS_PER_CYCLE }}
-        run: python3 actions_monitor.py --once
-
-      # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
-      # 注意：git add 是原子的，若路径中有不存在的，整条命令会失败，
-      #       所以这里只加 state（archive 已在 .gitignore 里，不进仓库）。
-      - name: 保存去重状态
         run: |
-          git config user.name  "hxm5-bot"
-          git config user.email "hxm5-bot@users.noreply.github.com"
-          if [ ! -f state/hxm5_state.json ]; then
-            echo "没有状态文件，跳过"
-            exit 0
+          set -u
+
+          # 上一轮提交回来的去重状态。首次运行文件不存在，脚本会自动初始化基线。
+          mkdir -p state
+          if [ -f state/hxm5_state.json ]; then
+            echo "已有状态：$(python3 -c "import json;print(len(json.load(open('state/hxm5_state.json'))['seen']))") 条记录"
+          else
+            echo "首次运行，将初始化基线"
           fi
-          git add -f state/hxm5_state.json
-          if git diff --cached --quiet; then
-            echo "状态无变化，跳过提交"
-            exit 0
-          fi
-          git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
-          # 并发场景：两个 run 撞在一起时，远端可能已被另一个更新，
-          # 直接 push 会被拒（non-fast-forward）导致整个 run 标红。
-          # 这里 rebase 后重试；仍失败也只给 warning，不让 run 失败（下轮会补上状态）。
-          for i in 1 2 3; do
-            if git pull --rebase --autostash origin main >/dev/null 2>&1 \
-               && git push >/dev/null 2>&1; then
-              echo "状态已提交（第 $i 次尝试）"
-              exit 0
+
+          CYCLE_SECONDS=300            # 每轮间隔 5 分钟
+          RUN_SECONDS=$((340 * 60))    # 本次 job 最长盯 340 分钟
+          END_AT=$(( $(date +%s) + RUN_SECONDS ))
+          ROUND=0
+
+          echo "::notice::长循环启动 | 最多盯 $((RUN_SECONDS / 60)) 分钟 | 每轮间隔 ${CYCLE_SECONDS}s"
+
+          while [ "$(date +%s)" -lt "$END_AT" ]; do
+            ROUND=$((ROUND + 1))
+            echo ""
+            echo "========== 第 ${ROUND} 轮 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC | 剩余 $(( (END_AT - $(date +%s)) / 60 )) 分钟 =========="
+
+            # 扫一轮。单轮异常不拖垮整个循环（下轮自然补上）
+            python3 actions_monitor.py --once || echo "::warning::第 ${ROUND} 轮执行异常，继续下一轮"
+
+            # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
+            if [ -f state/hxm5_state.json ]; then
+              git add -f state/hxm5_state.json
+              if git diff --cached --quiet; then
+                echo "状态无变化，跳过提交"
+              else
+                git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')" >/dev/null 2>&1 || true
+                PUSHED=0
+                for i in 1 2 3; do
+                  if git pull --rebase --autostash origin main >/dev/null 2>&1 \
+                     && git push >/dev/null 2>&1; then
+                    echo "状态已提交（第 ${i} 次尝试）"
+                    PUSHED=1
+                    break
+                  fi
+                  echo "第 ${i} 次推送失败，3 秒后重试..."
+                  git rebase --abort >/dev/null 2>&1 || true
+                  sleep 3
+                done
+                [ "$PUSHED" = "1" ] || echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
+              fi
             fi
-            echo "第 $i 次推送失败，3 秒后重试..."
-            git rebase --abort >/dev/null 2>&1 || true
-            sleep 3
+
+            # 剩余时间不够再跑一轮就直接收尾，避免白等
+            if [ $(( END_AT - $(date +%s) )) -le "$CYCLE_SECONDS" ]; then
+              echo "剩余时间不足一轮间隔，结束循环"
+              break
+            fi
+            sleep "$CYCLE_SECONDS"
           done
-          echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
+
+          echo ""
+          echo "===== 长循环结束，本次共执行 ${ROUND} 轮 ====="
