@@ -1,25 +1,19 @@
 name: 线报屋监控
 
-# ============================================================
-# ⚠️ 重要背景（2026-09-28 实测）
+# 触发策略（2026-09-28 改版）
+# ---------------------------------------------------------------------
+# 背景：GitHub 的 schedule（cron）自 2026-08-26 起平台级不稳定。
+#   实测 09-21~09-28 共 60 次运行：配置写的是每 5 分钟，实际触发间隔
+#   最短 105 分钟 / 中位 205 分钟 / 最长 413 分钟 —— 中位慢 41 倍，
+#   一天只跑约 6 次。线报是瞬时信息，这个频率基本抓不到。
 #
-# GitHub Actions 的 schedule 自 2026-08-26 起出现平台级故障，定时触发被大幅延迟。
-# 本仓库配置的是 */5（理论每 5 分钟一次），但对最近 60 次运行实测下来：
-#     间隔 最短 105 / 中位 205 / 平均 227 / 最长 413 分钟（变异系数 63%）
-#     理论 288 次/天  →  实际约 6 次/天，中位慢了 41 倍
-# 与套餐、计费、仓库活跃度均无关。社区讨论：
-#     https://github.com/orgs/community/discussions/206019
+# 对策：cron 只负责「定期唤醒」，真正的覆盖率靠 job 内部长循环。
+#   一次触发 → job 内部连续轮询约 340 分钟 → 到点自动结束
+#   → 下一次 cron 触发的 run 无缝接上（concurrency 串行化的副产品）
+#   覆盖面：每天约 6 次 → 每天约 1300 次
 #
-# 应对：不再指望 cron 的频率，改成「一次触发，job 内长循环」——
-#   · 只要被触发一次（cron 或手动都行），就连续盯约 5 小时 40 分，
-#     中间每 5 分钟扫一轮，覆盖率从「每天 6 次」拉满到接近连续。
-#   · concurrency 保持 cancel-in-progress: false：
-#       同一时刻只有 1 个实例在跑，新的排队等着「接力」。
-#       GitHub 对同一 concurrency group 只保留 1 个 pending，
-#       更新的触发会替换掉旧的 pending，所以【不会堆积累积】。
-#       这样长循环不会被打断，去重状态提交也最安全。
-# ============================================================
-
+# 成本：本仓库是 public，GitHub 托管 runner 对公开仓库完全免费、不限时长。
+#   ⚠️ 若将来改成 private，Free 计划每月只有 2000 分钟，长循环会瞬间用穿。
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -30,8 +24,9 @@ on:
 permissions:
   contents: write
 
-# 同一时刻只允许一个实例，避免两个 run 同时写状态导致去重失效
-# 新的触发会成为 pending，等当前这个跑完立刻接力（不算打断）
+# 同一时刻只允许一个实例，避免两个 run 同时写状态导致去重失效。
+# 长循环会占住这个 group，期间的 cron 触发会排队，只保留最新的一个 pending，
+# 前一个结束后立刻接上 —— 这正是我们要的「无缝衔接」。
 concurrency:
   group: hxm5-monitor
   cancel-in-progress: false
@@ -39,8 +34,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # GitHub 单个 job 硬上限 360 分钟。这里留 15 分钟余量
-    # 给 checkout / setup-python / 收尾，循环体内自限 340 分钟。
+    # GitHub 单个 job 硬上限 6 小时（360 分钟），这里留 15 分钟余量给收尾
     timeout-minutes: 355
 
     steps:
@@ -52,13 +46,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 循环内多轮提交，身份只需配一次
-      - name: 配置 git 身份
-        run: |
-          git config user.name  "hxm5-bot"
-          git config user.email "hxm5-bot@users.noreply.github.com"
-
-      - name: 循环监控（长循环覆盖 cron 延迟）
+      # 长循环主体：一次触发连续轮询，直到接近 job 时限
+      - name: 执行监控（长循环）
         env:
           HXM5_STATE_PATH: state/hxm5_state.json
           # 企微已于 2026-09-24 按老大要求关闭（GitHub 版只推钉钉）
@@ -73,62 +62,72 @@ jobs:
           HXM5_REPLY_LIMIT: ${{ secrets.HXM5_REPLY_LIMIT }}
           HXM5_PUSH_IMAGES: ${{ secrets.HXM5_PUSH_IMAGES }}
           HXM5_MAX_POSTS_PER_CYCLE: ${{ secrets.HXM5_MAX_POSTS_PER_CYCLE }}
+          # ---- 长循环参数（想调节奏只改这三行）----
+          HXM5_LOOP_MINUTES: '340'
+          HXM5_SLEEP_SECONDS: '60'
+          HXM5_MAX_FAILS: '5'
         run: |
           set -u
-
-          # 上一轮提交回来的去重状态。首次运行文件不存在，脚本会自动初始化基线。
           mkdir -p state
-          if [ -f state/hxm5_state.json ]; then
-            echo "已有状态：$(python3 -c "import json;print(len(json.load(open('state/hxm5_state.json'))['seen']))") 条记录"
+
+          if [ -f "$HXM5_STATE_PATH" ]; then
+            echo "已有去重状态：$(python3 -c "import json;print(len(json.load(open('$HXM5_STATE_PATH'))['seen']))") 条记录"
           else
-            echo "首次运行，将初始化基线"
+            echo "首次运行，脚本将初始化基线"
           fi
 
-          CYCLE_SECONDS=300            # 每轮间隔 5 分钟
-          RUN_SECONDS=$((340 * 60))    # 本次 job 最长盯 340 分钟
-          END_AT=$(( $(date +%s) + RUN_SECONDS ))
+          git config user.name  "hxm5-bot"
+          git config user.email "hxm5-bot@users.noreply.github.com"
+
+          DEADLINE=$(( $(date +%s) + HXM5_LOOP_MINUTES * 60 ))
           ROUND=0
+          FAILS=0
 
-          echo "::notice::长循环启动 | 最多盯 $((RUN_SECONDS / 60)) 分钟 | 每轮间隔 ${CYCLE_SECONDS}s"
-
-          while [ "$(date +%s)" -lt "$END_AT" ]; do
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             ROUND=$((ROUND + 1))
-            echo ""
-            echo "========== 第 ${ROUND} 轮 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC | 剩余 $(( (END_AT - $(date +%s)) / 60 )) 分钟 =========="
+            STAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+            echo "::group::第 $ROUND 轮 · $STAMP"
 
-            # 扫一轮。单轮异常不拖垮整个循环（下轮自然补上）
-            python3 actions_monitor.py --once || echo "::warning::第 ${ROUND} 轮执行异常，继续下一轮"
+            if python3 actions_monitor.py --once; then
+              FAILS=0
+            else
+              FAILS=$((FAILS + 1))
+              echo "::warning::第 $ROUND 轮脚本退出码非 0（连续失败 $FAILS 次）"
+            fi
 
-            # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
-            if [ -f state/hxm5_state.json ]; then
-              git add -f state/hxm5_state.json
+            if [ "$FAILS" -ge "$HXM5_MAX_FAILS" ]; then
+              echo "::error::连续 $FAILS 轮失败，提前结束长循环"
+              echo "::endgroup::"
+              break
+            fi
+
+            # 去重状态必须每轮回写仓库。
+            # 脚本在「无新帖」时完全不写 state，所以这里绝大多数轮次会走到
+            # 「状态无变化」分支，不会产生 commit 洪水。
+            if [ -f "$HXM5_STATE_PATH" ]; then
+              git add -f "$HXM5_STATE_PATH"
               if git diff --cached --quiet; then
-                echo "状态无变化，跳过提交"
+                echo "状态无变化"
               else
-                git commit -m "chore: 更新去重状态 $(date -u +'%Y-%m-%d %H:%M UTC')" >/dev/null 2>&1 || true
+                git commit -m "chore: 更新去重状态 $STAMP [轮 $ROUND]" >/dev/null
                 PUSHED=0
                 for i in 1 2 3; do
                   if git pull --rebase --autostash origin main >/dev/null 2>&1 \
                      && git push >/dev/null 2>&1; then
-                    echo "状态已提交（第 ${i} 次尝试）"
+                    echo "状态已提交（第 $i 次尝试）"
                     PUSHED=1
                     break
                   fi
-                  echo "第 ${i} 次推送失败，3 秒后重试..."
+                  echo "第 $i 次推送失败，3 秒后重试"
                   git rebase --abort >/dev/null 2>&1 || true
                   sleep 3
                 done
-                [ "$PUSHED" = "1" ] || echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
+                [ "$PUSHED" -eq 1 ] || echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
               fi
             fi
 
-            # 剩余时间不够再跑一轮就直接收尾，避免白等
-            if [ $(( END_AT - $(date +%s) )) -le "$CYCLE_SECONDS" ]; then
-              echo "剩余时间不足一轮间隔，结束循环"
-              break
-            fi
-            sleep "$CYCLE_SECONDS"
+            echo "::endgroup::"
+            sleep "$HXM5_SLEEP_SECONDS"
           done
 
-          echo ""
-          echo "===== 长循环结束，本次共执行 ${ROUND} 轮 ====="
+          echo "长循环结束，本轮共执行 $ROUND 轮"
