@@ -39,6 +39,16 @@ DIGS = "0123456789abcdefghijklmnopqrstuvwxyz"
 CST = timezone(timedelta(hours=8))
 WECOM_LIMIT = 4000
 
+# 退出码：只有真正坏掉时才返回非 0，让 GitHub Actions 能把这一轮标红。
+# 以前所有异常路径都 return 0，导致「一条都不推」时 run 依然显示绿色成功。
+EXIT_OK = 0
+EXIT_NO_CHANNEL = 2          # 一个推送渠道都没配，等于脚本根本没干活
+EXIT_ALL_PUSH_FAILED = 3     # 有帖子要推，但一条都没推成功
+
+# 单条帖子最多尝试推送次数。到上限才放弃并标记已读 ——
+# 必须有上限，否则一条永久失败的帖子会一直堵在队首（max_posts_per_cycle 有配额）。
+MAX_PUSH_RETRY = 3
+
 
 # ------------------------------------------------------------ 配置
 def cfg(key, default=None, cast=str):
@@ -481,10 +491,13 @@ def load_state():
                 st = json.load(f)
             st.setdefault("seen", [])
             st.setdefault("initialized", False)
+            # pending: {tid: 已失败次数} —— 已发现但还没送达的帖子，下轮补发。
+            # 旧状态文件没有这个键，setdefault 保证向前兼容。
+            st.setdefault("pending", {})
             return st
         except Exception:  # noqa
             pass
-    return {"seen": [], "initialized": False}
+    return {"seen": [], "initialized": False, "pending": {}}
 
 
 def save_state(st):
@@ -507,25 +520,80 @@ def archive_post(t):
 
 
 # ------------------------------------------------------------ 主流程
+def _deliver(state, tid, t, cid_title):
+    """推送一条帖子并维护状态。返回 'ok' / 'retry' / 'giveup'。
+
+    ⭐ 关键：**只有推送成功（或重试到上限放弃）才写 seen**。
+    以前 seen 是无条件追加的，于是任何一次瞬时故障（钉钉 20 条/分钟限流、
+    网络抖动、5xx）都会把这条帖子永久标记为"已处理"，再也不会重试 = 通知永久丢失。
+    """
+    key = str(tid)
+    if push_all(t, cid_title):
+        state["pending"].pop(key, None)
+        state["seen"].append(key)
+        return "ok"
+
+    n = state["pending"].get(key, 0) + 1
+    if n >= MAX_PUSH_RETRY:
+        state["pending"].pop(key, None)
+        state["seen"].append(key)
+        log("推送失败 #%s，累计 %d 次，放弃重试" % (key, n), "ERROR")
+        return "giveup"
+
+    state["pending"][key] = n
+    log("推送失败 #%s（第 %d 次，下轮补发）" % (key, n), "WARN")
+    return "retry"
+
+
+def _resend_pending(state, cid_title, dry):
+    """补发上一轮未送达的帖子（按原顺序）。返回 (成功条数, 尝试条数)。"""
+    if dry or not state.get("pending"):
+        return 0, 0
+    ok = 0
+    attempted = 0
+    log("上轮有 %d 条未送达，先补发" % len(state["pending"]))
+    for key in list(state["pending"].keys()):
+        try:
+            t = fetch_thread(key)
+        except Exception as e:  # noqa
+            log("补发抓详情失败 %s: %s" % (key, e), "WARN")
+            n = state["pending"].get(key, 0) + 1
+            if n >= MAX_PUSH_RETRY:
+                state["pending"].pop(key, None)
+                state["seen"].append(key)
+                log("补发 #%s 连续抓取失败，放弃" % key, "ERROR")
+            else:
+                state["pending"][key] = n
+            save_state(state)
+            continue
+        attempted += 1
+        if _deliver(state, key, t, cid_title) == "ok":
+            ok += 1
+            log("补发成功 #%s" % key)
+        save_state(state)
+        time.sleep(0.5)
+    return ok, attempted
+
+
 def run_once(dry=False):
     cfg = load_config()
     state = load_state()
+    state.setdefault("pending", {})     # 兼容还没有 pending 字段的旧状态文件
+
     # 只要任意一个渠道配置了就继续（注意：新增渠道时必须同步加进来，
     # 否则会出现「关了旧渠道 → 脚本以为没渠道 → 直接退出 → 一条不推」）
     _has_any = any((cfg.get(k) or "").strip() for k in
                    ("wecom_webhook", "dingtalk_webhook", "bark_key"))
     if not _has_any and not dry:
         log("没有配置任何推送渠道，退出", "ERROR")
-        return 0
+        return EXIT_NO_CHANNEL
 
     data = fetch_list(cfg["cid"], 1)
     items = data.get("list") or []
     if not items:
         log("列表为空")
-        return 0
+        return EXIT_OK
     cid_title = data.get("title") or ("线报 %s" % cfg["cid"])
-    seen = set(state["seen"])
-    new_items = [it for it in items if str(it.get("ID")) not in seen]
 
     if not state.get("initialized"):
         state["seen"].extend(str(it.get("ID")) for it in items)
@@ -533,42 +601,58 @@ def run_once(dry=False):
         save_state(state)
         log("首次运行：记录 %d 条为基线，不推送" % len(items))
         if not cfg.get("push_on_first_run"):
-            return 0
+            return EXIT_OK
 
-    if not new_items:
-        log("无新帖（列表最新 #%s）" % items[0].get("ID"))
-        return 0
+    # ⚠️ 必须把 pending 里的也算成"已见过"：否则它们会被当成新帖再推一遍，
+    #    结果同一轮里「补发一次 + 当新帖再推一次」= 重复推送。
+    seen = set(state["seen"]) | set(state["pending"])
+    new_items = [it for it in items if str(it.get("ID")) not in seen]
 
-    new_items.reverse()
-    cap = cfg.get("max_posts_per_cycle", 12)
-    if len(new_items) > cap:
-        log("本轮新帖 %d 条，只处理最早 %d 条" % (len(new_items), cap), "WARN")
-        new_items = new_items[:cap]
-
-    log("发现 %d 条新帖" % len(new_items))
     ok = 0
-    for it in new_items:
-        tid = it.get("ID")
-        try:
-            t = fetch_thread(tid)
-        except Exception as e:  # noqa
-            log("抓详情失败 %s: %s" % (tid, e), "ERROR")
-            t = {"ID": tid, "title": it.get("Title"), "Content": it.get("Content"),
-                 "time": it.get("time"), "nick": it.get("nick"), "reply": [],
-                 "img": it.get("img") or []}
-        archive_post(t)
-        if dry:
-            log("[dry] #%s %s" % (tid, clean_text(t.get("title"))[:40]))
-        elif push_all(t, cid_title):
-            ok += 1
-            log("已推送 #%s %s" % (tid, clean_text(t.get("title"))[:40]))
-        else:
-            log("推送失败 #%s" % tid, "ERROR")
-        state["seen"].append(str(tid))
-        save_state(state)
-        time.sleep(0.5)
+    attempted = 0
+
+    # 阶段 1：先把上一轮没送达的补出去（这部分不占本轮新帖配额）
+    r_ok, r_attempted = _resend_pending(state, cid_title, dry)
+    ok += r_ok
+    attempted += r_attempted
+
+    # 阶段 2：处理本轮新帖
+    if new_items:
+        new_items.reverse()             # 列表是「新→旧」，反转后按时间顺序推
+        cap = cfg.get("max_posts_per_cycle", 12)
+        if len(new_items) > cap:
+            log("本轮新帖 %d 条，只处理最早 %d 条" % (len(new_items), cap), "WARN")
+            new_items = new_items[:cap]
+
+        log("发现 %d 条新帖" % len(new_items))
+        for it in new_items:
+            tid = it.get("ID")
+            try:
+                t = fetch_thread(tid)
+            except Exception as e:  # noqa
+                log("抓详情失败 %s: %s" % (tid, e), "ERROR")
+                t = {"ID": tid, "title": it.get("Title"), "Content": it.get("Content"),
+                     "time": it.get("time"), "nick": it.get("nick"), "reply": [],
+                     "img": it.get("img") or []}
+            archive_post(t)
+            if dry:
+                log("[dry] #%s %s" % (tid, clean_text(t.get("title"))[:40]))
+                state["seen"].append(str(tid))
+            else:
+                attempted += 1
+                if _deliver(state, tid, t, cid_title) == "ok":
+                    ok += 1
+                    log("已推送 #%s %s" % (tid, clean_text(t.get("title"))[:40]))
+            save_state(state)
+            time.sleep(0.5)
+
     log("本轮完成，成功推送 %d 条" % ok)
-    return ok
+
+    # 有推送动作但一条都没成功 → 判定为故障，让 run 变红（这样才会被注意到）
+    if attempted and not ok:
+        log("本轮 %d 条推送全部失败" % attempted, "ERROR")
+        return EXIT_ALL_PUSH_FAILED
+    return EXIT_OK
 
 
 def main():
@@ -611,9 +695,9 @@ def main():
         log("回溯完成 %d/%d" % (cnt, n))
         return 0
 
-    run_once(dry=("--dry" in args))
-    return 0
+    # 返回 run_once 的退出码，让「没配渠道 / 全部推送失败」能把 run 标红
+    return run_once(dry=("--dry" in args))
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(main())
