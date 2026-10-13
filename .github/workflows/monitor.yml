@@ -88,6 +88,8 @@ jobs:
           RUN_SECONDS=$((340 * 60))    # 本次 job 最长盯 340 分钟
           END_AT=$(( $(date +%s) + RUN_SECONDS ))
           ROUND=0
+          FAIL_STREAK=0                # 连续失败的轮数
+          FAIL_LIMIT=3                 # 连续这么多轮都失败就终止本次 job（15 分钟）
 
           echo "::notice::长循环启动 | 最多盯 $((RUN_SECONDS / 60)) 分钟 | 每轮间隔 ${CYCLE_SECONDS}s"
 
@@ -96,8 +98,13 @@ jobs:
             echo ""
             echo "========== 第 ${ROUND} 轮 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC | 剩余 $(( (END_AT - $(date +%s)) / 60 )) 分钟 =========="
 
-            # 扫一轮。单轮异常不拖垮整个循环（下轮自然补上）
-            python3 actions_monitor.py --once || echo "::warning::第 ${ROUND} 轮执行异常，继续下一轮"
+            # 扫一轮。单轮异常不拖垮整个循环（下轮自然补上），但要记下退出码，
+            # 连续失败说明是真故障（而不是偶发抖动），见下面的判定。
+            RC=0
+            python3 actions_monitor.py --once || RC=$?
+            if [ "$RC" != "0" ]; then
+              echo "::warning::第 ${ROUND} 轮退出码 ${RC}（2=没配推送渠道 / 3=推送全部失败）"
+            fi
 
             # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
             if [ -f state/hxm5_state.json ]; then
@@ -119,6 +126,26 @@ jobs:
                   sleep 3
                 done
                 [ "$PUSHED" = "1" ] || echo "::warning::状态推送失败，本轮状态未保存（下一轮会自动补上）"
+              fi
+            fi
+
+            # 故障判定 —— 放在状态提交【之后】，保证本轮已成功推送的记录不会丢。
+            # 以前这里是 `|| echo warning`，退出码被吞掉：即使一条都推不出去，
+            # 循环也会一路跑到 340 分钟结束，run 依然是绿色，故障完全不可见。
+            if [ "$RC" = "0" ]; then
+              FAIL_STREAK=0
+            else
+              FAIL_STREAK=$((FAIL_STREAK + 1))
+              echo "::error::第 ${ROUND} 轮失败（退出码 ${RC}），已连续 ${FAIL_STREAK} 轮"
+              # 退出码 2 = 一个推送渠道都没配。配置错误重试多少次都不会好，立即终止。
+              if [ "$RC" = "2" ]; then
+                echo "::error::没有任何推送渠道，脚本无法工作，立即终止本次 job"
+                exit 2
+              fi
+              # 退出码 3 = 有帖子要推但一条都没成功。连续几轮如此 = 真故障。
+              if [ "$FAIL_STREAK" -ge "$FAIL_LIMIT" ]; then
+                echo "::error::已连续 ${FAIL_STREAK} 轮推送全部失败，终止本次 job（检查钉钉 webhook 是否失效 / 是否被限流）"
+                exit 3
               fi
             fi
 
