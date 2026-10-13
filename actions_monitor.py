@@ -10,8 +10,15 @@
   - 单次执行即退出，不常驻
 
 本地调试：
-  HXM5_WECOM_WEBHOOK=xxx python3 actions_monitor.py --once
+  python3 actions_monitor.py --once       # 跑一轮就退出（Actions 用的就是这个）
+  python3 actions_monitor.py --dry        # 空跑：只打印不推送
   python3 actions_monitor.py --test       # 发一条测试消息
+  python3 actions_monitor.py --backfill N # 回溯最近 N 条
+
+退出码：
+  0 = 正常（含"无新帖"）
+  2 = 一个推送渠道都没配（脚本无法工作）
+  3 = 有帖子要推，但一条都没成功
 """
 import os
 import sys
@@ -29,6 +36,10 @@ from datetime import datetime, timezone, timedelta
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.environ.get("HXM5_STATE_PATH") or os.path.join(HERE, "state.json")
 ARCHIVE_DIR = os.path.join(HERE, "archive")
+# 归档开关。Actions 版跑在一次性虚拟机上，archive/ 被 .gitignore 挡住 →
+# 写了随虚拟机销毁，纯无效 IO。默认关闭；本地想留档时设 HXM5_ARCHIVE=1。
+ARCHIVE_ENABLED = (os.environ.get("HXM5_ARCHIVE") or "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 BASE = "https://www.hxm5.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -38,6 +49,10 @@ MASK = 0xFFFFFFFF
 DIGS = "0123456789abcdefghijklmnopqrstuvwxyz"
 CST = timezone(timedelta(hours=8))
 WECOM_LIMIT = 4000
+# 钉钉 markdown 正文的实际上限远高于 4000（多方实现按 20000 处理，
+# 官方自定义机器人文档未给出该字段的确切数值）→ 这里留足余量取 18000。
+# 以前误用 4000，等于白白浪费了 80% 的空间，长帖频繁触发截断。
+DT_LIMIT = 18000
 
 # 退出码：只有真正坏掉时才返回非 0，让 GitHub Actions 能把这一轮标红。
 # 以前所有异常路径都 return 0，导致「一条都不推」时 run 依然显示绿色成功。
@@ -65,6 +80,10 @@ def cfg(key, default=None, cast=str):
 
 CONFIG = {}
 
+# 默认值的【唯一出处】—— 不要在调用点再写一遍，否则两边会悄悄不一致
+# （push_images 曾经就是 load_config 写 False、push_all 写 True，是个维护陷阱）
+DEFAULT_PUSH_IMAGES = False
+
 
 def load_config():
     global CONFIG
@@ -79,7 +98,7 @@ def load_config():
         "max_posts_per_cycle": cfg("max_posts_per_cycle", 12, int),
         "include_replies": cfg("include_replies", True, bool),
         "include_images": cfg("include_images", True, bool),
-        "push_images": cfg("push_images", False, bool),
+        "push_images": cfg("push_images", DEFAULT_PUSH_IMAGES, bool),
         "max_images_per_post": cfg("max_images_per_post", 3, int),
         "reply_limit": cfg("reply_limit", 15, int),
         "push_on_first_run": cfg("push_on_first_run", False, bool),
@@ -185,11 +204,24 @@ def clean_text(s):
     return s.strip()
 
 
+TRUNC_MARK = "\n\n…(过长已截断)"
+
+
 def truncate_bytes(s, limit):
+    """按 UTF-8 字节截断，保证【结果连截断标记一起也不超过 limit 字节】。
+
+    ⚠️ 以前是把正文截到 limit 再拼标记，于是实际载荷 = limit + 标记长度，
+    会悄悄超出平台上限（实测 4021 > 4000）。所以这里先把标记的额度扣掉。
+    """
     b = s.encode("utf-8")
     if len(b) <= limit:
         return s
-    return b[:limit].decode("utf-8", "ignore") + "\n\n…(过长已截断)"
+    mk = TRUNC_MARK.encode("utf-8")
+    if limit <= len(mk):
+        # 额度连截断标记都放不下 → 不加标记，硬截断，仍然保证不超上限
+        return b[:limit].decode("utf-8", "ignore")
+    # "ignore" 保证多字节字符不会被劈成半个（否则平台可能整条拒收）
+    return b[:limit - len(mk)].decode("utf-8", "ignore") + TRUNC_MARK
 
 
 # ------------------------------------------------------------ 推送
@@ -227,8 +259,11 @@ def build_markdown(t, cid_title):
     L.append("")
     if nick:
         L.append("发帖人：%s" % nick)
-    L.append("[查看原帖](%s/t/%s)" % (BASE, tid))
-    return truncate_bytes("\n".join(L), WECOM_LIMIT)
+    # ⭐ 原帖链接【不参与截断】：先给它预留额度，再截正文。
+    #   以前是先拼全文再从尾部切，长帖会把链接一起切掉 → 推送里没有原帖入口。
+    tail = "\n\n[查看原帖](%s/t/%s)" % (BASE, tid)
+    budget = WECOM_LIMIT - len(tail.encode("utf-8"))
+    return truncate_bytes("\n".join(L), budget) + tail
 
 
 def push_wecom(markdown):
@@ -339,12 +374,12 @@ def build_dingtalk(t, cid_title):
             L.append("> **%s**：%s" % (r.get("nick") or "匿名", rc))
         if len(replies) > lim:
             L.append("> …还有 %d 条" % (len(replies) - lim))
-    L.append("")
-    L.append("原帖：")
-    L.append("```")
-    L.append("%s/t/%s" % (BASE, tid))
-    L.append("```")
-    return n_title, truncate_bytes("\n".join(L), 4000)
+    # ⭐ 链接块（含 ``` 围栏）最后拼，且【先给它预留额度】再截断正文。
+    #   以前是"先拼全文、再从尾部截断"，于是长帖会把链接连同 ``` 闭合围栏一起切掉 ——
+    #   恰好把 09-17 费力解决的「钉钉链接必须用代码块」这个成果静默废掉。
+    tail = "\n".join(["", "原帖：", "```", "%s/t/%s" % (BASE, tid), "```"])
+    budget = DT_LIMIT - len(tail.encode("utf-8"))
+    return n_title, truncate_bytes("\n".join(L), budget) + tail
 
 
 def push_dingtalk(title, text):
@@ -467,7 +502,7 @@ def push_all(t, cid_title):
         detail.append("Bark=%s" % ("ok" if ok else "FAIL"))
         any_ok = any_ok or ok
 
-    if has_wecom and imgs and CONFIG.get("push_images", True):
+    if has_wecom and imgs and CONFIG.get("push_images", DEFAULT_PUSH_IMAGES):
         n = min(len(imgs), CONFIG.get("max_images_per_post", 3))
         sent = 0
         for u in imgs[:n]:
@@ -495,8 +530,11 @@ def load_state():
             # 旧状态文件没有这个键，setdefault 保证向前兼容。
             st.setdefault("pending", {})
             return st
-        except Exception:  # noqa
-            pass
+        except Exception as e:  # noqa
+            # 以前这里静默 pass：状态损坏 → 返回空状态 → 下轮把整个列表当新基线
+            # 且【不推送】，行为跟"首次运行"一模一样，日志里完全看不出异常。
+            # 行为本身是安全的（不会重复轰炸），但必须留下痕迹。
+            log("状态文件解析失败，已按空状态继续（本轮会重建基线、不推送）: %s" % e, "WARN")
     return {"seen": [], "initialized": False, "pending": {}}
 
 
@@ -513,6 +551,8 @@ def save_state(st):
 
 
 def archive_post(t):
+    if not ARCHIVE_ENABLED:
+        return
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
     day = datetime.now(CST).strftime("%Y-%m-%d")
     with open(os.path.join(ARCHIVE_DIR, "%s.jsonl" % day), "a", encoding="utf-8") as f:
@@ -658,6 +698,11 @@ def run_once(dry=False):
 def main():
     args = sys.argv[1:]
     load_config()
+
+    # --once：跑一轮就退出（Actions 每轮调一次，所以它就是默认行为）。
+    # 以前这个参数没被识别，只是"碰巧"落在最后一个分支才生效 ——
+    # 看起来有语义、实际没有，会误导后来维护的人。这里显式接受它。
+    args = [a for a in args if a != "--once"]
 
     if "--test" in args:
         ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
