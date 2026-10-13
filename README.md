@@ -1,126 +1,210 @@
-# 线报屋监控 → 企业微信推送
+# 线报屋监控 → 钉钉推送
 
-每 **60 秒**抓取一次 `https://www.hxm5.com/xianbao/3/`（热门活动），发现新帖立即把
-**标题 + 正文全文 + 图片链接 + 全部回复** 推送到企业微信群「线报推送」。
+抓取 `https://www.hxm5.com/xianbao/3/`（热门活动），发现新帖立即把
+**标题 + 正文 + 图片 + 回复 + 原帖链接** 推到钉钉群。
 
-## 运行位置（重要）
+> **本文档最后校订：2026-10-13**。此前版本描述的是"服务器每分钟跑 + 推企微 + 本机开机自启"，
+> 那套架构已经不存在（服务器 2026-09-22 销毁、企微 2026-09-24 关闭），已重写。
 
-监控**跑在腾讯云轻量服务器上**，本机不再运行 —— 两边同时跑会重复推送。
+---
 
-| 项目 | 值 |
+## 一、现在是怎么跑的
+
+**唯一运行位置：GitHub Actions**（仓库 `zhdash/hxm5-monitor`，**public**）。
+
+```yaml
+on:
+  schedule:      - cron: '*/5 * * * *'
+  workflow_dispatch:
+timeout-minutes: 355        # job 最长 5 小时 55 分
+concurrency:  group: hxm5-monitor, cancel-in-progress: false
+```
+
+关键在于**「一次触发，job 内长循环」**：
+
+```
+被触发一次 ──► 连续盯约 340 分钟，每 5 分钟扫一轮 ──► 循环结束
+```
+
+**为什么要长循环**：GitHub 的 `schedule` 是 best-effort，自 2026-08-26 起出现平台级故障。
+实测 60 次运行的间隔是 **最短 105 / 中位 205 / 最长 413 分钟**（理论应每 5 分钟一次）。
+社区讨论：<https://github.com/orgs/community/discussions/206019>
+
+所以**不再指望 cron 的频率**，只要被触发一次就把这几小时盯满。
+想更密就配外部调度器打 `workflow_dispatch`（见 `HEARTBEAT_SETUP.md`）。
+
+### 渠道现状
+
+| 渠道 | 状态 |
 |---|---|
-| 服务器 | 广州 · `114.132.102.43`（实例 `lhins-p91l961t`，Ubuntu 24.04 / Python 3.12） |
-| 程序目录 | `/opt/hxm5/` |
-| 定时任务 | 用户级 crontab，**每分钟**执行 `server_monitor.py --once` |
-| 日志 / 存档 | `/opt/hxm5/monitor.log` · `/opt/hxm5/archive/` |
+| **钉钉** | ✅ **唯一启用**（加签模式） |
+| 企业微信 | ⛔ 2026-09-24 按需求关闭（workflow 里已注释，取消注释即可恢复） |
+| Bark (iOS) | ⚪ 未启用 |
 
-服务器端用的是 `server_monitor.py`（**cron 版**：单次执行即退出，不做常驻进程，重启自动恢复）。
-本机版 `hxm5_monitor.py` 保留备用。
+---
 
-SSH 登录后常用命令：
+## 二、文件结构
+
+```
+actions_monitor.py          ⭐ 唯一活的实现（GitHub Actions 版）
+test_hxm5.py                回归测试（61 项断言，含端到端）
+.github/workflows/monitor.yml   线上入口：长循环 + 状态提交
+state/hxm5_state.json       去重状态（由 workflow 每轮提交回仓库）
+deploy_actions.py           最初的建仓/部署工具
+ACTIONS_DEPLOY.md           部署历史与实测记录
+HEARTBEAT_SETUP.md          外部心跳（cron-job.org）操作单
+CODE_REVIEW.md              2026-10-13 代码审查报告
+legacy/                     ⛔ 已停用的历史实现（服务器版 / SCF 版 / 本机版），仅存档
+```
+
+> ⚠️ **改动行为时只改 `actions_monitor.py`**。
+> `legacy/` 里还有三份几乎同源的 monitor（与 actions 版重复率高达 80.1%），
+> 历史上正是「改一处漏一处」导致了 2026-09-24「一条都不推」的事故（详见 `legacy/README.md`）。
+
+---
+
+## 三、配置（全部走 GitHub Secrets）
+
+环境变量名 = 仓库 Secret 名带 `HXM5_` 前缀。未配置项有脚本内默认值兜底。
+
+| Secret | 默认 | 说明 |
+|---|---|---|
+| `HXM5_DINGTALK_WEBHOOK` | — | **必填**。留空则脚本判定"没配渠道"，直接以退出码 2 失败 |
+| `HXM5_DINGTALK_SECRET` | — | 填了走**加签**模式；留空走关键词模式 |
+| `HXM5_CID` | `3` | 板块：`3`=热门活动，`0`=最新线报 |
+| `HXM5_MAX_POSTS_PER_CYCLE` | `12` | 单轮最多处理几条新帖 |
+| `HXM5_REPLY_LIMIT` | `15` | 每帖最多附带多少条回复 |
+| `HXM5_PUSH_IMAGES` | `false` | 是否额外发原图（企微专用，钉钉图片是内嵌的） |
+| `HXM5_WECOM_WEBHOOK` | — | 已注释；恢复企微时再启用 |
+
+本地跑测试时用同名环境变量即可。
+
+---
+
+## 四、去重与重试（重要）
+
+状态文件 `state/hxm5_state.json` 有两个字段：
+
+```json
+{ "seen": ["2935931", ...],          // 已送达的帖子 ID
+  "pending": { "2935902": 2 } }      // 已发现但【没送出去】的，值=已失败次数
+```
+
+**规则**：
+- 只有**推送成功**（或重试到上限放弃）才写进 `seen`
+- 推送失败 → 记进 `pending`，**下一轮优先补发**
+- 单条最多试 `MAX_PUSH_RETRY = 3` 次，到上限才放弃并标记已读
+  （**必须有上限**，否则一条永久失败的帖子会堵死队列）
+- 补发**不占用**本轮新帖配额
+
+> 以前 `seen` 是无条件追加的 → 任何一次瞬时故障（限流/网络抖动/5xx）
+> 都会把帖子永久标记为"已处理"，**再也不会重试 = 通知永久丢失**。2026-10-13 已修。
+
+---
+
+## 五、退出码（决定 run 红不红）
+
+| 码 | 含义 | workflow 的行为 |
+|---|---|---|
+| `0` | 正常（含"无新帖"） | 继续循环 |
+| `2` | 一个推送渠道都没配 | **立即终止 job**（配置错误，重试无意义） |
+| `3` | 有帖子要推但一条都没成功 | 连续 **3 轮**如此即终止 job |
+
+终止时 run 变红，GitHub 会发失败通知 —— 这是"故障可见"的唯一途径。
+
+> ⚠️ 长循环里 `python3 … || RC=$?` **必须接住退出码**。以前写的是 `|| echo "::warning::"`，
+> 退出码被吞掉，于是即使一条都推不出去，循环也会跑满 340 分钟且 run 依然绿色。
+
+---
+
+## 六、本地常用操作
 
 ```bash
-tail -20 /opt/hxm5/monitor.log                              # 看日志
-/usr/bin/python3 /opt/hxm5/server_monitor.py --test         # 测推送
-/usr/bin/python3 /opt/hxm5/server_monitor.py --backfill 3   # 补推最近 3 条
-crontab -l                                                  # 看定时任务
-crontab -l | grep -v hxm5 | crontab -                       # 停用（保留其他任务）
+# 跑一轮（Actions 用的就是这个）
+python actions_monitor.py --once
+
+# 空跑：只打印不推送（不会污染 state，因为不写 seen）
+python actions_monitor.py --dry
+
+# 各渠道连通性测试
+python actions_monitor.py --test
+
+# 补推最近 N 条
+python actions_monitor.py --backfill 3
+
+# 回归测试（打桩 + 本地假钉钉，不会发真实消息）
+python test_hxm5.py
+
+# 看线上调度实况
+python heartbeat.py --status
+
+# 手动催一次抓取
+python heartbeat.py
 ```
 
-## 推送内容与渠道
+---
 
-一条新帖会推三样东西：
+## 七、凭据管理
 
-1. **企微文字卡片**（markdown）—— 标题 + 正文 + 回复 + 原帖链接
-2. **企微图片** —— 帖子配图用 `image` 类型真发原图，每帖最多 `max_images_per_post`（默认 3）张
-3. **Bark 通知**（iOS）—— 标题 + 正文摘要，`icon` 用首图，点击跳原帖
-
-> 企微的 markdown 消息**不支持内嵌图片**，这是官方限制，所以图片走独立的 `image` 类型消息
-> （base64 + md5，编码前需 ≤ 2MB）。
-
-渠道开关都在 `config.json`：`wecom_webhook` 留空则不推企微，`bark_key` 留空则不推 Bark。
-
-**企微限速 20 条/分钟**，程序内置滑动窗口限速（18 条/分钟）自动排队。
-如果一条帖子图很多、又频繁更新，可能触发排队等待 —— 此时可调小 `max_images_per_post`。
-
-## 文件说明
-
-| 文件 | 作用 |
-|---|---|
-| `hxm5_monitor.py` | 主程序（纯标准库，无第三方依赖） |
-| `start_monitor.py` | 后台启动器（脱离终端独立运行） |
-| `config.json` | 配置：板块、间隔、Webhook 等 |
-| `state.json` | 已推送帖子 ID（去重，重启不重复推） |
-| `monitor.log` | 运行日志（自动轮转，保留 3 份 5MB） |
-| `archive/日期.jsonl` | 帖子原文存档，每行一条完整 JSON |
-| `1-start.bat` / `2-stop.bat` | 双击启动 / 停止 |
-
-## 本机启动（备用，当前未启用）
-
-上云后本机的开机自启项已移除、进程已停止，避免与服务器重复推送。
-若服务器不可用、想改回本机运行：
-
-- **启动**：双击 `1-start.bat`
-- **停止**：双击 `2-stop.bat`
-- **恢复开机自启**：在启动文件夹（`Win+R` 输入 `shell:startup`）新建一个 vbs，
-  内容为 `Set ws = CreateObject("WScript.Shell")` 换行后加
-  `ws.Run """C:\Users\jones\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"" """ & 本目录 & "\hxm5_monitor.py""", 0, False`
-  （注：**必须存成 ANSI/GBK 编码**，因为路径含中文）
-
-程序内置**单实例保护**：重复启动时会检测到已有进程并直接退出。
-
-**排查**：`python hxm5_monitor.py --status` 看是否在跑（以进程真实存活为准，不是只看 pid 文件）；
-没在跑就双击 `1-start.bat`。日志在 `monitor.log`。
-
-## 常用操作
+**所有密钥都用 Windows DPAPI 加密存在 `~/.workbuddy/secrets/`，明文一律不落地。**
 
 ```bash
-python hxm5_monitor.py --status      # 查看运行状态
-python hxm5_monitor.py --test        # 发一条测试消息
-python hxm5_monitor.py --backfill 5  # 补推最近 5 条（验证效果）
-python hxm5_monitor.py --dry         # 单轮演练，不推送
-python hxm5_monitor.py               # 前台常驻（调试用）
+python ~/wbcrypt.py list                 # 看有哪些
+python ~/wbcrypt.py get gh_token         # 取出来（会打印到终端）
+echo <新值> | python ~/wbcrypt.py save <名字>
 ```
 
-停止：双击 `2-stop.bat`，或 `taskkill /F /PID <monitor.pid 里的数字>`
+当前在库：`gh_token`、`dingtalk_webhook`、`dingtalk_secret`、`wecom_webhook`、
+`tc_secret_id`、`tc_secret_key`。
 
-## 配置项（config.json）
+> ⚠️ **历史遗留提醒**：`deploy_scf.py` 曾在**公开仓库**里硬编码过一个完整的企微 webhook。
+> 2026-10-13 已改为从加密库读取。**那个旧 webhook 建议在企微后台删除对应机器人**——
+> 虽然企微推送已关闭，但凭据本身曾公开暴露过。
 
-| 字段 | 说明 |
-|---|---|
-| `cid` | 板块 ID：`3`=热门活动，`0`=最新线报（更新最快最全） |
-| `interval_sec` | 轮询间隔，默认 60 秒 |
-| `wecom_webhook` | 企业微信「消息推送」Webhook 地址 |
-| `max_posts_per_cycle` | 单轮最多处理几条新帖 |
-| `push_on_first_run` | 首次运行是否推送存量帖（默认 false，只建基线） |
-| `reply_limit` | 每条帖子最多附带多少条回复 |
+---
 
-改完配置**需要重启才生效**。
+## 八、技术要点（以后维护用）
 
-## 技术要点（以后维护用）
-
-站点是 JS 动态渲染的 SPA，静态 HTML 没有帖子数据，走的是自研 JSON 接口，
-并且**带防爬签名**，签名算法逆向自 `/ui/app.js`：
+站点是 JS 动态渲染的 SPA，静态 HTML 没有数据，走自研 JSON 接口并**带防爬签名**，
+算法逆向自 `/ui/app.js`：
 
 ```
-jt = floor(Date.now() / 180000)                    # 5 分钟一档的时间片
-jx = FNV1a32("<path>|<querystring>|hxm5-json-guard-v1") 然后转 36 进制
+jt = floor(Date.now() / 180000)                          # 5 分钟一档的时间片
+jx = FNV1a32("<path>|<querystring>|hxm5-json-guard-v1")  # 再转 36 进制
 ```
 
-请求要求：`POST`、`Content-Type: application/x-www-form-urlencoded`、
-必须带 `X-HXM5-JSON: 1` 和 `X-Requested-With: XMLHttpRequest`。
+请求要求：`POST` + `Content-Type: application/x-www-form-urlencoded`，
+且必须带 `X-HXM5-JSON: 1`、`X-Requested-With: XMLHttpRequest`。
 
 - 列表：`/xianbao/{cid}/json/`，参数 `r=list`
 - 详情：`/t/{id}/json/`，参数 `r=thread&id={id}`
-- 返回统一为 `{"code":200,"data":{...}}`
+- 统一返回 `{"code":200,"data":{...}}`
 
-**若失效**：多半是站点改了盐值或算法，重新拉 `/ui/app.js` 搜 `JSON_GUARD_SALT`
-和 `jsonGuardHash` 即可，改 `hxm5_monitor.py` 顶部的 `SALT` 常量。
+**若失效**：多半是站点改了盐值，重新拉 `/ui/app.js` 搜 `JSON_GUARD_SALT` 和 `jsonGuardHash`，
+改 `actions_monitor.py` 顶部的 `SALT`。
 
-## 注意事项
+### 钉钉的两个坑（已踩过，别回退）
 
-- **已配置开机自启**（启动文件夹里的 `hxm5_monitor.vbs`），开机自动运行，不需要手动启动。
-  重启不会重复推送已推过的帖子；关机期间出现的新帖会在下次启动时补推（按 `max_posts_per_cycle` 分批）。
-- 企业微信「消息推送」限速 **20 条/分钟**，程序内置限速 18 条/分钟并自动排队。
-- 企微 markdown **不支持内嵌图片**，帖子配图以原图链接形式给出，点开可看。
-- 群聊若开启「全员禁言」，推送会失败。
+1. **链接必须用代码块包住**：
+   ```
+   原帖：
+   ```
+   https://www.hxm5.com/t/xxxx
+   ```
+   ```
+   裸 URL 会被钉钉自动链接化，然后**点击被安全网关拦 + 复制出来是 URL 编码**两个坑同时中招。
+   代码块里的原文才能长按干净复制。
+
+2. **尾部链接不参与截断**：构建消息时先给链接块预留字节额度，再截正文。
+   否则长帖会把链接连同 ` ``` ` 闭合围栏一起切掉，链接方案静默失效。
+
+---
+
+## 九、已知限制
+
+- **调度不准**：GitHub `schedule` 实测 2~7 小时才触发一次。长循环只在单次 job 内有效，
+  job 之间的空档依然存在。要真正拉满需外部心跳（见 `HEARTBEAT_SETUP.md`）。
+- **长循环占并发槽**：同一时刻只有一个 run，新的触发会 pending 排队。
+- **钉钉限流 20 条/分钟**，超过会被禁言约 10 分钟。
+- 仓库**必须保持 public**：改 private 会瞬间用穿免费额度的 2000 分钟/月。
+- 群聊若开启"全员禁言"，推送会失败。
