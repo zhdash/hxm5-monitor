@@ -54,6 +54,18 @@ WECOM_LIMIT = 4000
 # 以前误用 4000，等于白白浪费了 80% 的空间，长帖频繁触发截断。
 DT_LIMIT = 18000
 
+# ---- 内容指纹去重（与帖子 ID 无关）----
+# 只靠帖子 ID 去重是不够的，有三类情况会让「同一内容」被推第二次：
+#   ① 同一件事被不同人重发（ID 不同、正文几乎一样）
+#   ② 状态文件丢失/回滚后，同一个 ID 被重新当成新帖
+#   ③ 推送其实已送达，但 HTTP 响应超时被误判为失败 → 重试
+# 指纹由「标题+正文」算出，与 ID 无关，三类情况都能兜住。
+FP_TTL_SEC = 7 * 86400     # 同一内容的去重窗口：7 天
+MAX_SENT_FP = 2000         # 指纹表最多留多少条（只保留最新）
+FP_MIN_CHARS = 8           # 内容少于这个字数不做指纹去重，避免把不同短帖误判成同一篇
+SEEN_KEEP = 5000           # seen 保留条数。原为 3000：一旦超出，最老的会被丢弃，
+                           # 而"热门活动"列表里长期挂着的老帖就可能被重新推送。
+
 # 退出码：只有真正坏掉时才返回非 0，让 GitHub Actions 能把这一轮标红。
 # 以前所有异常路径都 return 0，导致「一条都不推」时 run 依然显示绿色成功。
 EXIT_OK = 0
@@ -222,6 +234,21 @@ def truncate_bytes(s, limit):
         return b[:limit].decode("utf-8", "ignore")
     # "ignore" 保证多字节字符不会被劈成半个（否则平台可能整条拒收）
     return b[:limit - len(mk)].decode("utf-8", "ignore") + TRUNC_MARK
+
+
+def content_fingerprint(t):
+    """算「帖子内容」的指纹，用于跨 ID 去重。内容过短时返回 ""（放弃去重）。
+
+    只对规范化后的「标题+正文」取哈希：空格/全角空格/大小写都不影响，
+    但正文本身的差异会被如实反映。**不包含帖子 ID、发帖人、时间**，
+    所以同一条线报被别人重发时，指纹相同 → 会被拦下。
+    """
+    title = clean_text(t.get("title") or t.get("word") or "")
+    body = clean_text(t.get("Content") or "")
+    raw = re.sub(r"[\s\u3000]+", "", title + "|" + body).lower()
+    if len(raw) < FP_MIN_CHARS:
+        return ""
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 # ------------------------------------------------------------ 推送
@@ -529,25 +556,38 @@ def load_state():
             # pending: {tid: 已失败次数} —— 已发现但还没送达的帖子，下轮补发。
             # 旧状态文件没有这个键，setdefault 保证向前兼容。
             st.setdefault("pending", {})
+            # sent_fp: {内容指纹: 推送时间戳} —— 跨 ID 防重复推送，与 seen 相互独立。
+            # 旧状态文件没有这个键，setdefault 保证向前兼容。
+            st.setdefault("sent_fp", {})
             return st
         except Exception as e:  # noqa
             # 以前这里静默 pass：状态损坏 → 返回空状态 → 下轮把整个列表当新基线
             # 且【不推送】，行为跟"首次运行"一模一样，日志里完全看不出异常。
             # 行为本身是安全的（不会重复轰炸），但必须留下痕迹。
             log("状态文件解析失败，已按空状态继续（本轮会重建基线、不推送）: %s" % e, "WARN")
-    return {"seen": [], "initialized": False, "pending": {}}
+    return {"seen": [], "initialized": False, "pending": {}, "sent_fp": {}}
 
 
 def save_state(st):
-    st["seen"] = st["seen"][-3000:]
+    st["seen"] = st["seen"][-SEEN_KEEP:]
+
+    # 指纹表：先按 TTL 淘汰过期项，再按数量留最新的一批，避免状态文件无限膨胀
+    now = int(time.time())
+    fp = st.get("sent_fp") or {}
+    fp = {k: int(v) for k, v in fp.items() if now - int(v) < FP_TTL_SEC}
+    if len(fp) > MAX_SENT_FP:
+        fp = dict(sorted(fp.items(), key=lambda kv: kv[1])[-MAX_SENT_FP:])
+    st["sent_fp"] = fp
+
     d = os.path.dirname(STATE_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=1)
+        json.dump(st, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, STATE_PATH)
-    log("状态已保存（累计记录 %d 条）" % len(st["seen"]))
+    log("状态已保存（seen %d 条 / 内容指纹 %d 个 / 待补发 %d 条）"
+        % (len(st["seen"]), len(fp), len(st.get("pending") or {})))
 
 
 def archive_post(t):
@@ -561,16 +601,32 @@ def archive_post(t):
 
 # ------------------------------------------------------------ 主流程
 def _deliver(state, tid, t, cid_title):
-    """推送一条帖子并维护状态。返回 'ok' / 'retry' / 'giveup'。
+    """推送一条帖子并维护状态。返回 'ok' / 'dupe' / 'retry' / 'giveup'。
 
-    ⭐ 关键：**只有推送成功（或重试到上限放弃）才写 seen**。
-    以前 seen 是无条件追加的，于是任何一次瞬时故障（钉钉 20 条/分钟限流、
-    网络抖动、5xx）都会把这条帖子永久标记为"已处理"，再也不会重试 = 通知永久丢失。
+    ⭐ 只有推送成功（或重试到上限放弃）才写 seen；
+      以前 seen 是无条件追加的，任何一次瞬时故障都会把帖子永久标记为"已处理"。
+
+    ⭐ 推送前先查内容指纹：**同一条内容在 TTL 内只推一次**，
+      与帖子 ID 无关。这样无论"别人重发同一件事"还是"状态丢失后同一 ID 被重推"，
+      都不会再发第二遍。
     """
     key = str(tid)
+    fp = content_fingerprint(t)
+
+    if fp:
+        last = state["sent_fp"].get(fp)
+        if last and time.time() - last < FP_TTL_SEC:
+            state["pending"].pop(key, None)
+            state["seen"].append(key)
+            log("内容重复，跳过 #%s（同内容已于 %.1f 小时前推送过）"
+                % (key, (time.time() - last) / 3600.0), "WARN")
+            return "dupe"
+
     if push_all(t, cid_title):
         state["pending"].pop(key, None)
         state["seen"].append(key)
+        if fp:
+            state["sent_fp"][fp] = int(time.time())
         return "ok"
 
     n = state["pending"].get(key, 0) + 1
@@ -606,10 +662,13 @@ def _resend_pending(state, cid_title, dry):
                 state["pending"][key] = n
             save_state(state)
             continue
-        attempted += 1
-        if _deliver(state, key, t, cid_title) == "ok":
+        r = _deliver(state, key, t, cid_title)
+        if r == "ok":
             ok += 1
+            attempted += 1
             log("补发成功 #%s" % key)
+        elif r != "dupe":          # retry / giveup 属于"真的尝试过"；dupe 是主动跳过
+            attempted += 1
         save_state(state)
         time.sleep(0.5)
     return ok, attempted
@@ -619,6 +678,7 @@ def run_once(dry=False):
     cfg = load_config()
     state = load_state()
     state.setdefault("pending", {})     # 兼容还没有 pending 字段的旧状态文件
+    state.setdefault("sent_fp", {})     # 兼容还没有内容指纹表的旧状态文件
 
     # 只要任意一个渠道配置了就继续（注意：新增渠道时必须同步加进来，
     # 否则会出现「关了旧渠道 → 脚本以为没渠道 → 直接退出 → 一条不推」）
@@ -679,10 +739,13 @@ def run_once(dry=False):
                 log("[dry] #%s %s" % (tid, clean_text(t.get("title"))[:40]))
                 state["seen"].append(str(tid))
             else:
-                attempted += 1
-                if _deliver(state, tid, t, cid_title) == "ok":
+                r = _deliver(state, tid, t, cid_title)
+                if r == "ok":
                     ok += 1
+                    attempted += 1
                     log("已推送 #%s %s" % (tid, clean_text(t.get("title"))[:40]))
+                elif r != "dupe":
+                    attempted += 1
             save_state(state)
             time.sleep(0.5)
 
