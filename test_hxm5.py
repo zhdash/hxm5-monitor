@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -253,6 +254,80 @@ s = json.load(open(E2E, encoding="utf-8"))
 chk(rc == 0 and not s["pending"], "恢复后补发成功，pending 清空")
 
 srv.shutdown()
+
+# ============================================================ E. 内容指纹去重
+print()
+print("=" * 74)
+print("E. 内容指纹去重（同内容只推一次）")
+print("=" * 74)
+
+# 这一段用"永远成功"的推送桩
+CALLS.clear()
+am.push_all = lambda t, cid_title: (CALLS.append(str(t["ID"])), True)[1]
+
+SAME_A = {"ID": "2001", "title": "工行立减金", "Content": "工行APP搜xx可领5元", "nick": "a"}
+SAME_B = {"ID": "2002", "title": "工行立减金", "Content": "工行APP搜xx可领5元", "nick": "b"}  # 同内容、不同 ID、不同人
+DIFF = {"ID": "2003", "title": "建行5块", "Content": "完全不同的另一条线报内容", "nick": "c"}
+SHORT = {"ID": "2004", "title": "可以领了", "Content": "", "nick": "d"}
+SHORT2 = {"ID": "2005", "title": "可以领了", "Content": "", "nick": "e"}
+
+st_fp = {"seen": [], "pending": {}, "sent_fp": {}}
+r1 = am._deliver(st_fp, "2001", SAME_A, "热")
+r2 = am._deliver(st_fp, "2002", SAME_B, "热")
+chk(r1 == "ok", "第一条正常推送")
+chk(r2 == "dupe", "同内容不同 ID → 第二次被判定为重复并跳过")
+chk(len(CALLS) == 1, "实际只发出 1 次推送")
+chk("2002" in st_fp["seen"], "被跳过的帖子仍标记已读（不会反复重试）")
+chk("2002" not in st_fp["pending"], "被跳过的不进 pending")
+
+chk(am._deliver(st_fp, "2003", DIFF, "热") == "ok", "不同内容照常推送")
+
+# 跨过 TTL 后允许再次推送
+fp_a = am.content_fingerprint(SAME_A)
+chk(bool(fp_a), "内容指纹非空")
+st_fp["sent_fp"][fp_a] = int(time.time()) - am.FP_TTL_SEC - 10
+CALLS.clear()
+chk(am._deliver(st_fp, "2006", SAME_A, "热") == "ok", "超过 TTL(7天) 后同内容允许再推")
+
+# 内容过短 → 不做指纹去重，避免误伤不同短帖
+st_s = {"seen": [], "pending": {}, "sent_fp": {}}
+a = am._deliver(st_s, "2004", SHORT, "热")
+b = am._deliver(st_s, "2005", SHORT2, "热")
+chk(a == "ok" and b == "ok", "内容 <8 字时不做指纹去重（两条都推，避免误伤）")
+chk(am.content_fingerprint(SHORT) == "", "短内容指纹为空")
+
+# 指纹表：持久化 + TTL 修剪 + 数量上限
+FP_STATE = os.path.join(tmpdir, "fp_state.json")
+am.STATE_PATH = FP_STATE
+old_ts = int(time.time()) - am.FP_TTL_SEC - 3600
+now_ts = int(time.time())
+big = {"seen": ["9001"], "pending": {},
+       "sent_fp": {"expired" + "0" * 9: old_ts, "fresh" + "0" * 11: now_ts}}
+am.save_state(big)
+saved = json.load(open(FP_STATE, encoding="utf-8"))
+chk("sent_fp" in saved, "sent_fp 已写入状态文件")
+chk(all(v >= now_ts - 5 for v in saved["sent_fp"].values()), "过期指纹已被 TTL 修剪掉")
+chk(len(saved["sent_fp"]) == 1, "只剩未过期的那条")
+
+reloaded = am.load_state()
+chk("sent_fp" in reloaded, "load_state 能读回 sent_fp")
+
+# 旧状态文件（无 sent_fp 字段）向前兼容
+old_fmt = os.path.join(tmpdir, "old_fmt.json")
+json.dump({"seen": ["1"], "initialized": True}, open(old_fmt, "w", encoding="utf-8"))
+am.STATE_PATH = old_fmt
+chk(am.load_state().get("sent_fp") == {}, "旧状态文件（无 sent_fp）自动补空表")
+
+# 容量上限
+many = {"seen": [], "pending": {},
+        "sent_fp": {"k%04d" % i: now_ts for i in range(am.MAX_SENT_FP + 50)}}
+am.STATE_PATH = FP_STATE
+am.save_state(many)
+chk(len(json.load(open(FP_STATE, encoding="utf-8"))["sent_fp"]) == am.MAX_SENT_FP,
+    "指纹表按 MAX_SENT_FP 截断（%d 条）" % am.MAX_SENT_FP)
+
+# 还原 STATE_PATH，避免影响后续
+am.STATE_PATH = STATE
 
 # ============================================================ 汇总
 print()
