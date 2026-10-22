@@ -146,26 +146,44 @@ def _fnv1a(s):
     return _b36(t)
 
 
-def _signed_body(path, params):
+API_PATH = "/api"
+
+
+def _signed_body(params):
+    """生成带签名的 POST body。
+
+    ⭐ 2026-10-22 站点改版，签名算法 **变了**：
+
+        旧：jx = FNV1a32("<path>|<querystring>|hxm5-json-guard-v1")
+        新：jx = FNV1a32("/api|<完整参数串含 jt>|hxm5-json-guard-v1")
+
+    新算法只认字面量 "/api" + 整个 body 参数串（**含 jt**）+ 盐，
+    不再包含 path 和 querystring。**参数键的插入顺序会直接影响签名**，
+    所以 params 的键顺序必须与站点前端保持一致，不能随意调整。
+    """
     p = dict(params)
-    p["jt"] = int(time.time() * 1000 // 180000)
+    p["jt"] = str(int(time.time() * 1000) // 180000)
     qs = urllib.parse.urlencode(p, quote_via=urllib.parse.quote)
-    return qs + "&jx=" + _fnv1a("%s|%s|%s" % (path, qs, SALT))
+    return qs + "&jx=" + _fnv1a("%s|%s|%s" % (API_PATH, qs, SALT))
 
 
-def api(path, params, retries=3):
-    body = _signed_body(path, params)
+def api(params, query="", referer=None, retries=3):
+    """POST /api?<query>，body 为签名后的参数串。"""
+    body = _signed_body(params)
+    url = BASE + API_PATH + (("?" + query) if query else "")
     last = None
     for i in range(retries):
         try:
-            req = urllib.request.Request(BASE + path, data=body.encode("utf-8"), headers={
+            req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST",
+                                         headers={
                 "User-Agent": UA,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-HXM5-JSON": "1",
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9",
-                "Referer": BASE + path.split("/json/")[0] + "/",
+                "Referer": referer or (BASE + "/"),
+                "Origin": BASE,
             })
             with urllib.request.urlopen(req, timeout=25) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
@@ -176,26 +194,27 @@ def api(path, params, retries=3):
             last = e
             if i < retries - 1:
                 time.sleep(2)
-    raise RuntimeError("request %s failed: %s" % (path, last))
+    raise RuntimeError("request %s?%s failed: %s" % (API_PATH, query, last))
 
 
 def fetch_list(cid, page=1):
-    if page and page > 1:
-        path = "/xianbao/%s/%s/json/" % (cid, page)
-    else:
-        path = "/xianbao/%s/json/" % cid
-    p = {"r": "list"}
-    if str(cid) == "3":
-        p["type"] = "hot"
-    elif str(cid) == "0":
-        p["type"] = "index"
-    else:
-        p["cid"] = cid
-    return api(path, p)
+    cid_s, page_s = str(cid), str(page)
+    # 键顺序 (r, type, cid, page, view) 必须与站点前端一致 —— 会影响签名
+    params = {
+        "r": "list",
+        "type": "index" if cid_s == "0" else "xianbao",
+        "cid": cid_s,
+        "page": page_s,
+        "view": "cards" if cid_s in ("2", "3") else "rows",
+    }
+    return api(params, "cate=%s&page=%s" % (cid_s, page_s),
+               referer=BASE + "/xianbao/%s/" % cid_s)
 
 
 def fetch_thread(tid):
-    return api("/t/%s/json/" % tid, {"r": "thread", "id": tid})
+    tid_s = str(tid)
+    return api({"r": "thread", "id": tid_s}, "tid=%s" % tid_s,
+               referer=BASE + "/t/%s/" % tid_s)
 
 
 # ------------------------------------------------------------ 文本处理
