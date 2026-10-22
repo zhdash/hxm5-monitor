@@ -190,23 +190,52 @@ echo <新值> | python ~/wbcrypt.py save <名字>
 
 ## 八、技术要点（以后维护用）
 
-站点是 JS 动态渲染的 SPA，静态 HTML 没有数据，走自研 JSON 接口并**带防爬签名**，
-算法逆向自 `/ui/app.js`：
+站点是 JS 动态渲染的 SPA，静态 HTML 里没有帖子数据，走自研 JSON 接口并**带防爬签名**。
+
+### 当前协议（2026-10-22 站点改版后）
 
 ```
-jt = floor(Date.now() / 180000)                          # 5 分钟一档的时间片
-jx = FNV1a32("<path>|<querystring>|hxm5-json-guard-v1")  # 再转 36 进制
+POST /api?cate=<cid>&page=<n>        # 列表
+POST /api?tid=<id>                   # 详情
+
+body = r=list&type=xianbao&cid=3&page=1&view=cards&jt=<时间片>      # 列表
+body = r=thread&id=<tid>&jt=<时间片>                                # 详情
+       …末尾追加 &jx=<签名>
+
+jt = floor(Date.now() / 180000)                                     # 5 分钟一档
+jx = FNV1a32("/api|" + <完整的 body 参数串，含 jt> + "|hxm5-json-guard-v1") → 36 进制
 ```
 
-请求要求：`POST` + `Content-Type: application/x-www-form-urlencoded`，
-且必须带 `X-HXM5-JSON: 1`、`X-Requested-With: XMLHttpRequest`。
+必须带的头：`Content-Type: application/x-www-form-urlencoded`、
+`X-HXM5-JSON: 1`、`X-Requested-With: XMLHttpRequest`，外加 `Referer` / `Origin`。
+统一返回 `{"code":200,"data":{...}}`。
 
-- 列表：`/xianbao/{cid}/json/`，参数 `r=list`
-- 详情：`/t/{id}/json/`，参数 `r=thread&id={id}`
-- 统一返回 `{"code":200,"data":{...}}`
+**⚠️ 两个容易踩的点**：
+1. 签名只认**字面量 `/api`**，不是实际 URL 的 path+query（旧版是后者）。
+2. **参数键的插入顺序会影响签名**（因为要对参数串取哈希）。
+   `r, type, cid, page, view` 的顺序不能动。
 
-**若失效**：多半是站点改了盐值，重新拉 `/ui/app.js` 搜 `JSON_GUARD_SALT` 和 `jsonGuardHash`，
-改 `actions_monitor.py` 顶部的 `SALT`。
+字段差异也要注意：**列表**里是 `Title` / `Reply`（首字母大写，`Reply` 是数量），
+**详情**里是 `title` / `reply`（小写，`reply` 是数组）。
+
+### 改版历史
+
+| 时间 | 变化 |
+|---|---|
+| ~2026-09 | `POST /xianbao/<cid>/json/`，签名含 path+querystring |
+| **2026-10-22** | 变为 `POST /api?cate=&page=`，签名改为 `/api\|参数串\|盐`（不含 path） |
+
+> ⚠️ 2026-10-22 那次改版导致抓取连续返回 **404**，脚本每轮异常退出，
+> 连续 3 轮后被 workflow 判定为故障、把 run 标红 —— 这是**预期行为**（故障可见），不是误报。
+
+### 若再次失效，怎么查
+
+1. 先确认 `POST /api?cate=3&page=1` 是否返回 `code=200`。
+2. 拉 `GET /xianbao/3/`，页面里有一段**内联脚本**就写着：
+   `s="/api|"+d.toString()+"|hxm5-json-guard-v1"` —— 这是签名的权威来源。
+3. 同时能看到 `e={r:"list",type:...,cid:...,page:...,view:...}` 的参数构造方式。
+4. 改 `actions_monitor.py` 里的 `API_PATH` / `_signed_body()` / `fetch_list()` / `fetch_thread()`。
+5. 改完先跑 `python test_hxm5.py`（含真实抓取），再部署。
 
 ### 钉钉的两个坑（已踩过，别回退）
 
