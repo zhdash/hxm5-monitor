@@ -18,7 +18,8 @@
 退出码：
   0 = 正常（含"无新帖"）
   2 = 一个推送渠道都没配（脚本无法工作）
-  3 = 有帖子要推，但一条都没成功
+  3 = 有帖子要推，但一条都没成功（推送侧问题）
+  4 = 抓不到帖子（站点改版 / 证书过期 / 宕机，抓取侧问题）
 """
 import os
 import sys
@@ -71,6 +72,9 @@ SEEN_KEEP = 5000           # seen 保留条数。原为 3000：一旦超出，�
 EXIT_OK = 0
 EXIT_NO_CHANNEL = 2          # 一个推送渠道都没配，等于脚本根本没干活
 EXIT_ALL_PUSH_FAILED = 3     # 有帖子要推，但一条都没推成功
+EXIT_FETCH_FAILED = 4        # 抓不到帖子（站点改版 / 证书过期 / 宕机）—— 站点侧问题
+                             # ⚠️ 必须和 3 分开：两者排查方向完全相反，
+                             #    以前混在一起，邮件说"推送失败"，实际是抓取坏了。
 
 # 单条帖子最多尝试推送次数。到上限才放弃并标记已读 ——
 # 必须有上限，否则一条永久失败的帖子会一直堵在队首（max_posts_per_cycle 有配额）。
@@ -215,6 +219,27 @@ def fetch_thread(tid):
     tid_s = str(tid)
     return api({"r": "thread", "id": tid_s}, "tid=%s" % tid_s,
                referer=BASE + "/t/%s/" % tid_s)
+
+
+def explain_fetch_error(e):
+    """把抓取失败翻译成一句人话（日志 / GitHub 邮件 / 注解都会看到这句）。
+
+    为什么需要它：以前抓取失败只会甩一段 traceback，而 workflow 又把任何异常
+    都报成"推送失败"，排查方向直接被带偏（10-22 站点改版、11-22 证书过期都踩过）。
+    """
+    s = str(e)
+    low = s.lower()
+    if "certificate has expired" in low or "certificate_verify_failed" in low:
+        return "站点 TLS 证书已过期 —— 站长需续期，不是本机或 GitHub 的问题"
+    if "self signed" in low or "unable to get local issuer" in low:
+        return "站点 TLS 证书校验失败 —— 证书链不完整或存在中间人"
+    if "404" in s:
+        return "接口返回 404 —— 站点很可能改版了，需重新适配接口路径/签名算法"
+    if "timed out" in low or "timeout" in low:
+        return "请求超时 —— 网络不稳或站点响应太慢"
+    if "code=" in s:
+        return "接口返回业务错误（%s）" % s[:120]
+    return s[:200]
 
 
 # ------------------------------------------------------------ 文本处理
@@ -707,7 +732,15 @@ def run_once(dry=False):
         log("没有配置任何推送渠道，退出", "ERROR")
         return EXIT_NO_CHANNEL
 
-    data = fetch_list(cfg["cid"], 1)
+    try:
+        data = fetch_list(cfg["cid"], 1)
+    except Exception as e:  # noqa
+        # 抓取失败 = 站点侧问题，返回独立的退出码 4。
+        # 不这样做的话，异常会一路冒到顶层 → 退出码 1 → workflow 报"推送失败"，
+        # 把排查引到钉钉身上（10-22 改版、11-22 证书过期都被这样误导过）。
+        log("抓取失败：%s" % explain_fetch_error(e), "ERROR")
+        return EXIT_FETCH_FAILED
+
     items = data.get("list") or []
     if not items:
         log("列表为空")
