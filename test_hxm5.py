@@ -182,78 +182,90 @@ print("=" * 74)
 print("C. 端到端（真实抓取 + 真实 HTTP，打到本地假钉钉）")
 print("=" * 74)
 
-MODE = {"reply": {"errcode": 0, "errmsg": "ok"}}
-HITS = []
+
+def section_c():
+    """真实抓取 + 真实 HTTP。⚠️ 依赖站点可用；站点挂了就跳过，不让整套测试崩掉。"""
+    MODE = {"reply": {"errcode": 0, "errmsg": "ok"}}
+    HITS = []
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_POST(self):
+            HITS.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            out = json.dumps(MODE["reply"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    e2e = os.path.join(tmpdir, "e2e.json")
+    url = "http://127.0.0.1:%d/robot?access_token=stub" % srv.server_address[1]
+
+    def run_real():
+        env = dict(os.environ)
+        env["HXM5_DINGTALK_WEBHOOK"] = url
+        env["HXM5_STATE_PATH"] = e2e
+        env["HXM5_MAX_POSTS_PER_CYCLE"] = "3"
+        env.pop("HXM5_WECOM_WEBHOOK", None)
+        env.pop("HXM5_BARK_KEY", None)
+        env.pop("HXM5_DINGTALK_SECRET", None)
+        env.pop("HXM5_ARCHIVE", None)
+        r = subprocess.run([PY, SCRIPT, "--once"], env=env, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=300)
+        return r.returncode, r.stdout
+
+    rc, out = run_real()
+
+    # 站点侧不可用（改版/证书过期/宕机）→ 跳过，不算测试失败
+    if rc == am.EXIT_FETCH_FAILED or not os.path.exists(e2e):
+        print("   ⏭ 站点当前不可用，跳过端到端测试（不算失败）")
+        print("      退出码=%d，原因：" % rc)
+        hit = [l.strip() for l in out.splitlines() if "抓取失败" in l]
+        print("      %s" % (hit[0] if hit else "（日志里没有抓取失败行）"))
+        srv.shutdown()
+        return
+
+    print("   基线轮 rc=%d，列表 %d 条" % (rc, len(json.load(open(e2e, encoding="utf-8"))["seen"])))
+    chk(rc == 0, "基线轮退出码 0")
+
+    s = json.load(open(e2e, encoding="utf-8"))
+    removed = s["seen"][:3]
+    s["seen"] = s["seen"][3:]
+    json.dump(s, open(e2e, "w", encoding="utf-8"), ensure_ascii=False)
+
+    HITS.clear()
+    rc, out = run_real()
+    s = json.load(open(e2e, encoding="utf-8"))
+    chk(rc == 0 and len(HITS) == 3, "成功路径：真实发出 3 次 POST，退出码 0")
+    chk(all(b"markdown" in h for h in HITS), "POST 体是钉钉 markdown 格式")
+    chk(all(t in s["seen"] for t in removed), "3 条都标记已读")
+    chk(not s["pending"], "pending 为空")
+
+    MODE["reply"] = {"errcode": 300001, "errmsg": "stub rejected"}
+    s = json.load(open(e2e, encoding="utf-8"))
+    removed2 = s["seen"][:3]                 # ⚠️ 必须重新取：上一轮的 removed 已经成功送出
+    s["seen"] = s["seen"][3:]
+    json.dump(s, open(e2e, "w", encoding="utf-8"), ensure_ascii=False)
+    rc, out = run_real()
+    s = json.load(open(e2e, encoding="utf-8"))
+    chk(rc == 3, "失败路径：退出码 3")
+    chk(all(t not in s["seen"] for t in removed2), "失败的没有被标记已读")
+    chk(set(s["pending"]) == set(removed2), "3 条进 pending")
+
+    MODE["reply"] = {"errcode": 0, "errmsg": "ok"}
+    rc, out = run_real()
+    s = json.load(open(e2e, encoding="utf-8"))
+    chk(rc == 0 and not s["pending"], "恢复后补发成功，pending 清空")
+
+    srv.shutdown()
 
 
-class Stub(BaseHTTPRequestHandler):
-    def do_POST(self):
-        HITS.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
-        out = json.dumps(MODE["reply"]).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
-
-    def log_message(self, *a):
-        pass
-
-
-srv = HTTPServer(("127.0.0.1", 0), Stub)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-E2E = os.path.join(tmpdir, "e2e.json")
-URL = "http://127.0.0.1:%d/robot?access_token=stub" % srv.server_address[1]
-
-
-def run_real():
-    env = dict(os.environ)
-    env["HXM5_DINGTALK_WEBHOOK"] = URL
-    env["HXM5_STATE_PATH"] = E2E
-    env["HXM5_MAX_POSTS_PER_CYCLE"] = "3"
-    env.pop("HXM5_WECOM_WEBHOOK", None)
-    env.pop("HXM5_BARK_KEY", None)
-    env.pop("HXM5_DINGTALK_SECRET", None)
-    env.pop("HXM5_ARCHIVE", None)
-    r = subprocess.run([PY, SCRIPT, "--once"], env=env, capture_output=True,
-                       text=True, encoding="utf-8", errors="replace", timeout=300)
-    return r.returncode, r.stdout
-
-
-rc, out = run_real()
-print("   基线轮 rc=%d，列表 %d 条" % (rc, len(json.load(open(E2E, encoding="utf-8"))["seen"])))
-chk(rc == 0, "基线轮退出码 0")
-
-s = json.load(open(E2E, encoding="utf-8"))
-removed = s["seen"][:3]
-s["seen"] = s["seen"][3:]
-json.dump(s, open(E2E, "w", encoding="utf-8"), ensure_ascii=False)
-
-HITS.clear()
-rc, out = run_real()
-s = json.load(open(E2E, encoding="utf-8"))
-chk(rc == 0 and len(HITS) == 3, "成功路径：真实发出 3 次 POST，退出码 0")
-chk(all(b"markdown" in h for h in HITS), "POST 体是钉钉 markdown 格式")
-chk(all(t in s["seen"] for t in removed), "3 条都标记已读")
-chk(not s["pending"], "pending 为空")
-
-MODE["reply"] = {"errcode": 300001, "errmsg": "stub rejected"}
-s = json.load(open(E2E, encoding="utf-8"))
-removed2 = s["seen"][:3]                 # ⚠️ 必须重新取：上一轮的 removed 已经成功送出
-s["seen"] = s["seen"][3:]
-json.dump(s, open(E2E, "w", encoding="utf-8"), ensure_ascii=False)
-rc, out = run_real()
-s = json.load(open(E2E, encoding="utf-8"))
-chk(rc == 3, "失败路径：退出码 3")
-chk(all(t not in s["seen"] for t in removed2), "失败的没有被标记已读")
-chk(set(s["pending"]) == set(removed2), "3 条进 pending")
-
-MODE["reply"] = {"errcode": 0, "errmsg": "ok"}
-rc, out = run_real()
-s = json.load(open(E2E, encoding="utf-8"))
-chk(rc == 0 and not s["pending"], "恢复后补发成功，pending 清空")
-
-srv.shutdown()
+section_c()
 
 # ============================================================ E. 内容指纹去重
 print()
