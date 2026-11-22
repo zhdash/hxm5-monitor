@@ -103,7 +103,7 @@ jobs:
             RC=0
             python3 actions_monitor.py --once || RC=$?
             if [ "$RC" != "0" ]; then
-              echo "::warning::第 ${ROUND} 轮退出码 ${RC}（2=没配推送渠道 / 3=推送全部失败）"
+              echo "::warning::第 ${ROUND} 轮退出码 ${RC}（1=脚本异常 / 2=没配渠道 / 3=推送失败 / 4=抓取失败）"
             fi
 
             # 把状态提交回仓库 —— 这是去重能跨轮生效的唯一方式
@@ -143,8 +143,17 @@ jobs:
                 exit 2
               fi
               # 退出码 3 = 有帖子要推但一条都没成功。连续几轮如此 = 真故障。
+              # ⚠️ 按退出码区分原因：抓取坏了和推送坏了，排查方向完全相反。
+              #    以前不管什么原因都报"推送全部失败"，把 10-22 站点改版、
+              #    11-22 证书过期两次事故的排查都带偏了。
               if [ "$FAIL_STREAK" -ge "$FAIL_LIMIT" ]; then
-                echo "::error::已连续 ${FAIL_STREAK} 轮推送全部失败，终止本次 job（检查钉钉 webhook 是否失效 / 是否被限流）"
+                if [ "$RC" = "4" ]; then
+                  echo "::error::已连续 ${FAIL_STREAK} 轮抓取失败 —— 站点侧问题（改版 / 证书过期 / 宕机），不是钉钉的问题"
+                elif [ "$RC" = "3" ]; then
+                  echo "::error::已连续 ${FAIL_STREAK} 轮推送全部失败 —— 检查钉钉 webhook 是否失效 / 是否被限流"
+                else
+                  echo "::error::已连续 ${FAIL_STREAK} 轮脚本异常（退出码 ${RC}），请查看本轮日志"
+                fi
                 exit 3
               fi
             fi
