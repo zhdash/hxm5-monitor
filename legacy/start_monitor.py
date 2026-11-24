@@ -5,7 +5,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PYW = r"C:\Users\jones\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"
+PYW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+if not os.path.exists(PYW):
+    PYW = sys.executable
 SCRIPT = os.path.join(HERE, "hxm5_monitor.py")
 PID_FILE = os.path.join(HERE, "monitor.pid")
 CONSOLE_LOG = os.path.join(HERE, "console.log")

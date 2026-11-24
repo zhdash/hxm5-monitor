@@ -102,7 +102,7 @@ def encrypt_secret(pub_key_b64, value):
         )
     raise RuntimeError(
         "缺少 PyNaCl，无法加密 Secret。请先安装：\n"
-        "  C:\\Users\\jones\\.workbuddy\\binaries\\python\\envs\\default\\Scripts\\pip.exe install pynacl"
+        "  pip install pynacl"
     )
 
 

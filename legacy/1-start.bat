@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-set PYW=C:\Users\jones\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe
+set PYW=pythonw
 
 if exist monitor.pid (
   set /p OLDPID=<monitor.pid
